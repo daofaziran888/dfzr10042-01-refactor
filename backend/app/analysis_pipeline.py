@@ -56,32 +56,72 @@ def pipeline_metric_to_dashboard(
     metrics: list[MetricDef],
     dimensions: list[DimensionDef],
     sample_data: list[dict[str, Any]],
+    registry: Any = None,
 ) -> dict[str, Any]:
     """完整的指标到看板分析管道。
 
     1. 从指标定义构建 OLAP 查询
     2. 执行查询并缓存结果
     3. 组装看板数据
+
+    传入口径登记处（SpecRegistry）时，每个指标先登记并钉住口径版本，
+    本地统计与 SQL 识别同一口径版本；口径被并发变更挤占的看板停在
+    口径冲突。未传入时行为与原来一致。
     """
     cached_results = {}
     dashboards = []
 
     for metric in metrics:
-        metric_val = metric.compute(sample_data)
+        plan_status = None
+        spec_version = None
 
-        # 构建 OLAP 查询
-        query = OlapQuery(
-            query_id=f"Q_{metric.metric_id}",
-            query_name=f"查询_{metric.metric_name}",
-            metrics=[metric],
-            dimensions=dimensions,
-            filters={"status": "已发布"},
-            order_by=f"{metric.field_name} DESC",
-            time_range=metric.period.value,
-        )
+        if registry is not None:
+            # 登记口径版本并执行看板计划
+            plan = registry.begin_analysis(metric)
+            run = registry.run_plan(
+                plan.plan_id,
+                sample_data,
+                dimensions=dimensions,
+                filters={"status": "已发布"},
+                order_by=f"{metric.field_name} DESC",
+                time_range=metric.period.value,
+                query_id=f"Q_{metric.metric_id}",
+                query_name=f"查询_{metric.metric_name}",
+            )
+            plan_status = run["status"]
+            spec_version = run.get("spec_version")
+            if plan_status != "已执行":
+                dashboards.append({
+                    "dashboard_id": f"DASH_{metric.metric_id}",
+                    "dashboard_name": f"看板_{metric.metric_name}",
+                    "metric_name": metric.metric_name,
+                    "computed_value": None,
+                    "sql": "",
+                    "cache_hit": 0,
+                    "chart_count": 0,
+                    "status": plan_status,
+                    "spec_version": spec_version,
+                })
+                continue
+            metric_val = run["local_value"]
+            query = run["query"]
+            sql = run["sql"]
+        else:
+            metric_val = metric.compute(sample_data)
 
-        # 生成 SQL
-        sql = query.build_sql()
+            # 构建 OLAP 查询
+            query = OlapQuery(
+                query_id=f"Q_{metric.metric_id}",
+                query_name=f"查询_{metric.metric_name}",
+                metrics=[metric],
+                dimensions=dimensions,
+                filters={"status": "已发布"},
+                order_by=f"{metric.field_name} DESC",
+                time_range=metric.period.value,
+            )
+
+            # 生成 SQL
+            sql = query.build_sql()
 
         # 缓存查询结果
         cache = QueryCache(
@@ -107,7 +147,7 @@ def pipeline_metric_to_dashboard(
         )
 
         dashboard_data = dashboard.collect_cached_results(list(cached_results.values()))
-        dashboards.append({
+        entry = {
             "dashboard_id": dashboard.dashboard_id,
             "dashboard_name": dashboard.dashboard_name,
             "metric_name": metric.metric_name,
@@ -115,7 +155,11 @@ def pipeline_metric_to_dashboard(
             "sql": sql,
             "cache_hit": cache.hit_count,
             "chart_count": len(dashboard_data),
-        })
+        }
+        if registry is not None:
+            entry["status"] = plan_status
+            entry["spec_version"] = spec_version
+        dashboards.append(entry)
 
     return {
         "pipeline": "metric_def -> olap_query -> query_cache -> dashboard_def",

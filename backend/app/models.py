@@ -95,39 +95,14 @@ class MetricDef:
     last_computed: str = ""
 
     def compute(self, rows: list[dict[str, Any]]) -> float:
-        """根据聚合方式对行数据进行确定性计算。"""
-        if self.aggregation == AggregationMethod.COUNT:
-            return float(len(rows))
-        if self.aggregation == AggregationMethod.COUNT_DISTINCT:
-            raw = [row.get(self.field_name) for row in rows]
-            return float(len(set(v for v in raw if v is not None)))
+        """根据聚合方式对行数据进行确定性计算。
 
-        # Numeric operations
-        values: list[float] = []
-        for row in rows:
-            v = row.get(self.field_name)
-            if v is not None:
-                try:
-                    values.append(float(v))
-                except (ValueError, TypeError):
-                    pass
-        if not values:
-            return 0.0
-        if self.aggregation == AggregationMethod.SUM:
-            return sum(values)
-        elif self.aggregation == AggregationMethod.AVG:
-            return sum(values) / len(values)
-        elif self.aggregation == AggregationMethod.MAX:
-            return max(values)
-        elif self.aggregation == AggregationMethod.MIN:
-            return min(values)
-        elif self.aggregation == AggregationMethod.P50:
-            return _percentile(values, 50)
-        elif self.aggregation == AggregationMethod.P90:
-            return _percentile(values, 90)
-        elif self.aggregation == AggregationMethod.P99:
-            return _percentile(values, 99)
-        return 0.0
+        聚合分支已收拢到 app.aggregation 的共用聚合口径描述，
+        离线指标计算仍按本地值计数。
+        """
+        from app.aggregation import aggregation_spec_for
+
+        return aggregation_spec_for(self).compute_local(rows)
 
 
 # ============================================================
@@ -168,32 +143,23 @@ class OlapQuery:
     order_by: str = ""
     time_range: str = ""
     cache_ttl: int = 300
+    # 钉住口径版本时由登记处注入：metric_id -> AggregationSpec
+    spec_overrides: dict[str, Any] = field(default_factory=dict)
 
     def build_sql(self) -> str:
-        """生成确定性 SQL 查询语句。"""
+        """生成确定性 SQL 查询语句。
+
+        聚合表达式与别名来自 app.aggregation 的共用聚合口径描述；
+        钉住口径版本时优先使用 spec_overrides 中的版本。
+        """
+        from app.aggregation import aggregation_spec_for
+
         if not self.metrics:
             return "SELECT 0"
         metric_exprs = []
         for m in self.metrics:
-            alias = f"_{m.metric_id}"
-            if m.aggregation == AggregationMethod.COUNT_DISTINCT:
-                metric_exprs.append(f"COUNT(DISTINCT {m.field_name}) AS {alias}")
-            elif m.aggregation == AggregationMethod.SUM:
-                metric_exprs.append(f"SUM({m.field_name}) AS {alias}")
-            elif m.aggregation == AggregationMethod.AVG:
-                metric_exprs.append(f"AVG({m.field_name}) AS {alias}")
-            elif m.aggregation == AggregationMethod.COUNT:
-                metric_exprs.append(f"COUNT({m.field_name}) AS {alias}")
-            elif m.aggregation == AggregationMethod.MAX:
-                metric_exprs.append(f"MAX({m.field_name}) AS {alias}")
-            elif m.aggregation == AggregationMethod.MIN:
-                metric_exprs.append(f"MIN({m.field_name}) AS {alias}")
-            elif m.aggregation == AggregationMethod.P50:
-                metric_exprs.append(f"PERCENTILE({m.field_name}, 0.5) AS {alias}")
-            elif m.aggregation == AggregationMethod.P90:
-                metric_exprs.append(f"PERCENTILE({m.field_name}, 0.9) AS {alias}")
-            elif m.aggregation == AggregationMethod.P99:
-                metric_exprs.append(f"PERCENTILE({m.field_name}, 0.99) AS {alias}")
+            spec = self.spec_overrides.get(m.metric_id) or aggregation_spec_for(m)
+            metric_exprs.append(spec.sql_expression())
 
         dim_keys = []
         for d in self.dimensions:
